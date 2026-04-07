@@ -92,7 +92,7 @@ namespace CSSREVIT
             }
           }
 
-          // Nhóm cây thép (Quantity > 1): tách từng vị trí, xóa bản gốc
+          // Nhóm cây thép (Quantity > 1): thu thập vị trí, convert về single, copy sang các vị trí còn lại
           foreach (ElementId id in multiBarIds)
           {
             try
@@ -105,7 +105,6 @@ namespace CSSREVIT
 
               if (newIds.Count > 0)
               {
-                doc.Delete(id);
                 explodedSets++;
                 createdBars += newIds.Count;
                 foreach (ElementId nid in newIds)
@@ -119,29 +118,29 @@ namespace CSSREVIT
           }
 
           // Tạo group mới theo type, đặt tên = tên type, pin lại
-          foreach (var kvp in rebarsByType)
-          {
-            if (kvp.Value.Count == 0) continue;
-            try
-            {
-              Group newGroup = doc.Create.NewGroup(kvp.Value);
-              for (int suffix = 0; suffix <= 100; suffix++)
-              {
-                try
-                {
-                  newGroup.GroupType.Name = suffix == 0 ? kvp.Key : $"{kvp.Key}_{suffix}";
-                  break;
-                }
-                catch { }
-              }
-              newGroup.Pinned = true;
-              groupsCreated++;
-            }
-            catch (Exception ex)
-            {
-              errors.Add($"Tạo group '{kvp.Key}': {ex.Message}");
-            }
-          }
+          //foreach (var kvp in rebarsByType)
+          //{
+          //  if (kvp.Value.Count == 0) continue;
+          //  try
+          //  {
+          //    Group newGroup = doc.Create.NewGroup(kvp.Value);
+          //    for (int suffix = 0; suffix <= 100; suffix++)
+          //    {
+          //      try
+          //      {
+          //        newGroup.GroupType.Name = suffix == 0 ? kvp.Key : $"{kvp.Key}_{suffix}";
+          //        break;
+          //      }
+          //      catch { }
+          //    }
+          //    newGroup.Pinned = true;
+          //    groupsCreated++;
+          //  }
+          //  catch (Exception ex)
+          //  {
+          //    errors.Add($"Tạo group '{kvp.Key}': {ex.Message}");
+          //  }
+          //}
 
           t.Commit();
         }
@@ -176,8 +175,9 @@ namespace CSSREVIT
     }
 
     /// <summary>
-    /// Tách một Rebar có NumberOfBarPositions > 1 thành từng Rebar đơn,
-    /// giữ nguyên: BarType, host, RebarStyle, hook type, hook orientation, normal.
+    /// Tách một Rebar có NumberOfBarPositions > 1 thành từng Rebar đơn.
+    /// Logic: thu thập tọa độ tất cả vị trí từ geometry trước,
+    /// convert bản gốc về single (vị trí 0), sau đó copy sang các vị trí còn lại.
     /// </summary>
     private List<ElementId> ExplodeRebarSet(Document doc, Rebar rebar, List<string> errors)
     {
@@ -190,62 +190,96 @@ namespace CSSREVIT
         return newIds;
       }
 
-      RebarBarType barType = doc.GetElement(rebar.GetTypeId()) as RebarBarType;
-      Element host = doc.GetElement(rebar.GetHostId());
-
-      if (host == null)
-      {
-        errors.Add($"Rebar {rebar.Id}: không tìm thấy host");
-        return newIds;
-      }
-
-      RebarStyle style = RebarStyle.Standard;
-      try
-      {
-        Parameter styleParam = rebar.LookupParameter("Rebar Style");
-        if (styleParam != null && styleParam.HasValue)
-          style = styleParam.AsInteger() == 1 ? RebarStyle.StirrupTie : RebarStyle.Standard;
-      }
-      catch { }
-
-      XYZ normal = accessor.Normal;
-
-      ElementId startHookId = rebar.GetHookTypeId(0);
-      ElementId endHookId = rebar.GetHookTypeId(1);
-      RebarHookType startHook = startHookId != ElementId.InvalidElementId
-        ? doc.GetElement(startHookId) as RebarHookType : null;
-      RebarHookType endHook = endHookId != ElementId.InvalidElementId
-        ? doc.GetElement(endHookId) as RebarHookType : null;
-
-      RebarHookOrientation startOrient = GetHookOrientation(rebar, 0);
-      RebarHookOrientation endOrient = GetHookOrientation(rebar, 1);
-
       int numBars = rebar.NumberOfBarPositions;
+
+      // ===== BƯỚC 1: Thu thập điểm origin của line đầu tiên từ geometry =====
+      var positions = new List<XYZ>();
+      XYZ basePoint = null;
+
+      Options geoOptions = new Options
+      {
+        ComputeReferences = false,
+        DetailLevel = ViewDetailLevel.Coarse,
+        IncludeNonVisibleObjects = true
+      };
 
       for (int i = 0; i < numBars; i++)
       {
+        XYZ pt = null;
+
+        // Lấy transform cho bar position này
+        Transform barTransform = accessor.GetBarPositionTransform(i);
+
+        // Lấy geometry từ element
+        GeometryElement geoElem = (rebar as Element).get_Geometry(geoOptions);
+
+        if (geoElem != null)
+        {
+          foreach (GeometryObject geoObj in geoElem)
+          {
+            Curve curve = null;
+
+            if (geoObj is GeometryInstance geoInst)
+            {
+              GeometryElement instGeom = geoInst.GetInstanceGeometry();
+              foreach (GeometryObject instObj in instGeom)
+              {
+                if (instObj is Curve c && c.Length > 0)
+                {
+                  curve = c;
+                  break;
+                }
+              }
+            }
+            else if (geoObj is Curve c && c.Length > 0)
+            {
+              curve = c;
+            }
+
+            if (curve != null && curve.Length > 0)
+            {
+              // Lấy origin (điểm đầu) của line đầu tiên
+              XYZ origin = curve.GetEndPoint(0);
+              pt = barTransform.OfPoint(origin);
+              break;
+            }
+          }
+        }
+
+        positions.Add(pt);
+        if (i == 0) basePoint = pt;
+      }
+
+      if (basePoint == null)
+      {
+        errors.Add($"Rebar {rebar.Id}: không lấy được geometry line vị trí 0");
+        return newIds;
+      }
+
+      // ===== BƯỚC 2: Convert bản gốc về single (giữ ở vị trí 0) =====
+      accessor.SetLayoutAsSingle();
+      newIds.Add(rebar.Id);
+
+      // ===== BƯỚC 3: Copy cây single sang từng vị trí còn lại =====
+      for (int i = 1; i < numBars; i++)
+      {
+        XYZ targetPt = positions[i];
+        if (targetPt == null) continue;
+
+        XYZ translation = targetPt.Subtract(basePoint);
+
         try
         {
-          // Lấy curves của từng cây tại vị trí i (world-space, không có hook)
-          IList<Curve> curves = rebar.GetCenterlineCurves(
-            false, false, true, MultiplanarOption.IncludeAllMultiplanarCurves, i);
+          ICollection<ElementId> copied = ElementTransformUtils.CopyElement(
+            doc, rebar.Id, translation);
 
-          if (curves == null || curves.Count == 0) continue;
-
-          Rebar newBar = Rebar.CreateFromCurves(
-            doc, style, barType, startHook, endHook,
-            host, normal, curves,
-            startOrient, endOrient, true, true);
-
-          if (newBar != null)
-          {
-            newBar.GetShapeDrivenAccessor()?.SetLayoutAsFixedNumber(1, 1, true, true, true);
-            newIds.Add(newBar.Id);
-          }
+          if (copied != null)
+            foreach (ElementId cid in copied)
+              newIds.Add(cid);
         }
         catch (Exception ex)
         {
-          errors.Add($"Rebar {rebar.Id} vị trí {i}: {ex.Message}");
+          errors.Add($"Rebar {rebar.Id} copy vị trí {i}: {ex.Message}");
         }
       }
 

@@ -571,15 +571,56 @@ namespace CSSREVIT
           // ? TRY CREATE REBAR
           XYZ p0 = curves[0].GetEndPoint(0);
           XYZ p1 = curves[0].GetEndPoint(1);
-          XYZ mid = p1 + new XYZ(0,0,10);
+
+          // ? FIX: Calculate proper third point for plane that's NOT collinear
+          // Reuse curveDir already calculated above
+          XYZ perpendicular;
+
+          // Find a perpendicular direction to curveDir
+          if (Math.Abs(curveDir.DotProduct(XYZ.BasisZ)) < 0.99)
+          {
+            // Curve is not parallel to Z, use Z for cross product
+            perpendicular = curveDir.CrossProduct(XYZ.BasisZ).Normalize();
+          }
+          else
+          {
+            // Curve is parallel to Z (vertical), use X for cross product
+            perpendicular = curveDir.CrossProduct(XYZ.BasisX).Normalize();
+          }
+
+          XYZ mid = p0 + perpendicular.Multiply(1.0); // 1 foot offset perpendicular to curve
           Plane plane = Plane.CreateByThreePoints(p0, p1, mid);
           XYZ nor = plane.Normal;
+
+          // ? IMPROVED: If multiple curves, calculate normal from actual curve geometry
           if(curves.Count > 1)
           {
             XYZ p2 = curves[1].GetEndPoint(1);
-            Plane plane2 = Plane.CreateByThreePoints(p1, p2, p0);
-            nor = plane2.Normal;
+
+            // Validate p0, p1, p2 are not collinear before creating plane
+            XYZ v1 = p1 - p0;
+            XYZ v2 = p2 - p0;
+            XYZ cross = v1.CrossProduct(v2);
+
+            if (cross.GetLength() > 0.001) // Not collinear
+            {
+              try
+              {
+                Plane plane2 = Plane.CreateByThreePoints(p1, p2, p0);
+                nor = plane2.Normal;
+                LogMessage($"      Using plane from 3 curve points: ({nor.X:F3},{nor.Y:F3},{nor.Z:F3})");
+              }
+              catch
+              {
+                LogMessage($"      Failed to create plane from curve points, using calculated perpendicular");
+              }
+            }
+            else
+            {
+              LogMessage($"      Points collinear, using calculated perpendicular normal");
+            }
           }
+
           try
           {
             rebar = Rebar.CreateFromCurves(doc, RebarStyle.Standard, rebarType, host, nor, curves,
@@ -785,14 +826,14 @@ namespace CSSREVIT
       if (templateType == null)
         throw new Exception($"Template rebar type '{templateName}' not found");
 
-      RebarBarType existingType = FindRebarBarType(doc, nameType);
+      RebarBarType existingType = FindRebarBarType(doc, $"{nameType}_D{diameter}");
       if (existingType != null)
       {
         _rebarTypeCache[cacheKey] = existingType;
         return existingType;
       }
 
-      RebarBarType newType = templateType.Duplicate(nameType) as RebarBarType;
+      RebarBarType newType = templateType.Duplicate($"{nameType}_D{diameter}") as RebarBarType;
       if (newType == null)
         throw new Exception($"Failed to create rebar type '{nameType}'");
 
